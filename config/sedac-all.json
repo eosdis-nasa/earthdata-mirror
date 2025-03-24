@@ -1,0 +1,30 @@
+{
+  "name": "sedac-all",
+  "query": {"daac": "SEDAC"},
+  "hosts_to_paths": {
+    "sedac.ciesin.columbia.edu": "sedac-root/",
+    "beta.sedac.ciesin.columbia.edu": "sedac-beta-root/",
+    "beta.ciesin.columbia.edu": "ciesin-beta-root/",
+    "doi.org": "doi-root"
+  },
+  "task_class": "SedacDownloadTask",
+  "ignore": [
+    "/arcgis/web/",
+    "https://search.earthdata.nasa.gov",
+    "https://www.earthdata.nasa.gov"
+  ],
+  "fixes": [
+    ["http:", "https:"],
+    ["https//", "https://"],
+    ["https:///", "https://"],
+    ["https:sedac", "https://sedac"],
+    [
+      "https://sedac.ciesin.columbia.edudownloadsmapssdeisdei-global-summer-lst-grids-2013sdei-global-summer-lst-grids-2013-night-min-south-america.png",
+      "https://sedac.ciesin.columbia.edu/downloads/maps/sdei/sdei-global-summer-lst-grids-2013/sdei-global-summer-lst-grids-2013-night-min-south-america.png"
+    ],
+    [
+      "https://sedac.ciesin.columbia.edudownloadsmapssdeisdei-global-summer-lst-grids-2013sdei-global-summer-lst-grids-2013-night-min-south-america.pdf",
+      "https://sedac.ciesin.columbia.edu/downloads/maps/sdei/sdei-global-summer-lst-grids-2013/sdei-global-summer-lst-grids-2013-night-min-south-america.pdf"
+    ]
+  ]
+}

@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+
+# /// script
+# name = "harvest"
+# version = "0.0.20250324"
+# dependencies = [
+#   "earthaccess",
+#   "asyncio",
+#   "aiohttp",
+#   "aiotools"
+# ]
+# requires-python = ">=3.0"
+# authors = [{name = "Patrick Quinn"},]
+# description = "Mirrors all non-NASA-Earthdata URLs present in a NASA Common Metadata Repository (CMR) query"
+# readme = "../README.md"
+# ///
+
+"""
+Mirror all non-NASA Earthdata URLs from a CMR query.
+"""
+
+import argparse
+import asyncio
+import glob
+import json
+import logging
+import math
+import os
+import pathlib
+import re
+import shutil
+import signal
+import sys
+import tempfile
+import time
+import traceback
+import urllib
+import urllib.parse
+
+import aiohttp
+import aiotools
+import earthaccess
+
+logger = logging.getLogger("earthdata.harvest")
+logging.basicConfig(level=logging.INFO)
+
+
+class DownloadTask:
+    """
+    Represents a download task for a specific URL.
+
+    Attributes:
+        id (str): The unique identifier for the task.
+        index (int): The index of the task.
+        url (str): The URL to download.
+        dest (str): The destination path for the downloaded file.
+        is_data (bool): Indicates if the URL is for data.
+        meta_path (str): The path to store metadata.
+        ignore_strings (list): List of strings to ignore in URLs.
+    """
+
+    def __init__(self, id: str, index: int, url: str, dest: str, is_data: bool, meta_path: str, ignore_strings: list[str]):
+        self.id = id
+        self.index = index
+        self.url = url
+        self.dest = dest
+        self.is_data = is_data
+        self.meta_path = meta_path
+        self.ignore_strings = ignore_strings
+
+    def _write(self, msgtype: str, text: str, ext: str = "txt") -> None:
+        """
+        Writes a message to a file.
+
+        Args:
+            msgtype (str): The type of message.
+            text (str): The text to write.
+            ext (str): The file extension.
+        """
+        with open(f"{self.meta_path}/{msgtype}.{ext}", "a") as f:
+            f.write(text + "\n")
+
+    def _write_success(self, url: str) -> None:
+        """
+        Writes a success message for a URL.
+
+        Args:
+            url (str): The URL that was successfully processed.
+        """
+        self._write("success", url)
+
+    def _write_missing(self, url: str) -> None:
+        """
+        Writes a missing message for a URL.
+
+        Args:
+            url (str): The URL that was missing.
+        """
+        self._write("missing", url)
+
+    def _write_error(self, reason: str) -> None:
+        """
+        Writes an error message.
+
+        Args:
+            reason (str): The reason for the error.
+        """
+        msgtype = "data_error" if self.is_data else "non_data_error"
+        self._write(msgtype, json.dumps({"reason": reason, **vars(self)}), ext="jsonl")
+
+    async def _get(self, session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout) -> aiohttp.ClientResponse:
+        """
+        Sends a GET request to the URL.
+
+        Args:
+            session (aiohttp.ClientSession): The client session.
+            timeout (aiohttp.ClientTimeout): The timeout for the request.
+
+        Returns:
+            aiohttp.ClientResponse: The response from the GET request.
+        """
+        return session.get(self.url, timeout=timeout)
+
+    async def run(self, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> bool:
+        """
+        Executes the download task.
+
+        Args:
+            session (aiohttp.ClientSession): The client session.
+            semaphore (asyncio.Semaphore): The semaphore to limit concurrency.
+
+        Returns:
+            bool: True if the download was successful, False otherwise.
+        """
+        url = self.url
+        timeout = aiohttp.ClientTimeout(
+            total=None,  # Avoid default 5 minute timeout
+            sock_connect=100,
+            sock_read=30,
+        )
+        chunk_size = 2**20
+        try:
+            async with semaphore:
+                if os.path.isfile("stop.txt"):
+                    return None
+                path = self.dest.split("/")
+                i = 0
+                while i < len(path) and not path[i].startswith("C"):
+                    i += 1
+                async with self._get(session, timeout=timeout) as response:
+                    if response.status == 404:
+                        self._write_missing(url)
+                    if response.status > 300:
+                        self._write_error(f"HTTP {response.status}")
+                    if response.status >= 300 and self.is_data:
+                        logger.error(
+                            f"{self.id} --- Failed data fetch! HTTP {response.status} for {url}"
+                        )
+                        return False
+                    elif response.status >= 300:
+                        logger.warning(
+                            f"{self.id} --- Failed non-data fetch: HTTP {response.status} for {url}"
+                        )
+                        return False
+                    else:
+                        final_url = str(response.url)
+                        if any([p in final_url for p in self.ignore_strings]):
+                            self._write_success(url)
+                            return True
+                        if os.path.dirname(self.dest) != "":
+                            os.makedirs(os.path.dirname(self.dest), exist_ok=True)
+                        bytes = 0
+                        start = time.time()
+                        length = int(response.headers.get("Content-Length", "0"))
+                        if length > 2**22:
+                            logger.info(
+                                f"{self.id} --- Downloading {length} bytes - {url}"
+                            )
+
+                        # Using tempfiles works around the tendency for AIO to use
+                        # a small chunk size regardless of IO settings and S3 Mountpoint
+                        # to upload multipart files on write. 64MiB is spooled in memory
+                        # to speed up IO on lots of small files
+                        with tempfile.SpooledTemporaryFile(max_size=2**26) as f:
+                            async for data in response.content.iter_chunked(chunk_size):
+                                bytes += len(data)
+                                f.write(data)
+                            f.seek(0)
+                            if bytes == 0:
+                                logger.warning(
+                                    f"{self.id} --- Zero byte file: {url} -> ({final_url})"
+                                )
+                                return False
+                            with open(self.dest, "wb") as dest_file:
+                                await asyncio.to_thread(
+                                    shutil.copyfileobj, f, dest_file
+                                )
+
+                        logger.info(
+                            f"{self.id} --- Completed. {bytes:,} bytes in {time.time() - start:0.3f}s"
+                        )
+                        self._write_success(url)
+                        return True
+        except Exception as e:
+            if self.is_data:
+                logging.error(traceback.format_exc())
+                logger.error(f"{self.id} --- Failed on exception: {url}")
+            self._write_error(f"Exception {e.__class__.__name__}: {e}")
+            return False
+
+
+class Harvester:
+    """
+    Harvests data from a CMR query and mirrors it to an output directory.
+
+    Attributes:
+        name (str): The name of the harvester.
+        query (dict): The query parameters for the CMR search.
+        hosts_to_paths (dict): Mapping of hosts to output paths.
+        ignore_strings (list): List of strings to ignore in URLs.
+        fixes (list): List of URL fixes to apply.
+        TaskClass (type): The class to use for download tasks.
+    """
+
+    def __init__(self, json_config: dict) -> None:
+        self.name = json_config["name"]
+        self.query = json_config["query"]
+        self.hosts_to_paths = json_config["hosts_to_paths"]
+        self.ignore_strings = json_config.get("ignore", [])
+        self.fixes = json_config.get("fixes", [])
+        self.TaskClass = getattr(
+            sys.modules[__name__], json_config.get("task_class", "DownloadTask")
+        )
+
+    async def _run_all(self, tasks: list[DownloadTask], concurrency: int = 20) -> None:
+        """
+        Runs all download tasks with a specified concurrency.
+
+        Args:
+            tasks (list): The list of download tasks.
+            concurrency (int): The maximum number of concurrent tasks.
+        """
+        creds = earthaccess.auth_environ()
+        auth = aiohttp.BasicAuth(
+            creds["EARTHDATA_USERNAME"], creds["EARTHDATA_PASSWORD"]
+        )
+        sem = asyncio.Semaphore(concurrency)
+        async with aiohttp.ClientSession(auth=auth) as session:
+            aiotasks = [asyncio.create_task(t.run(session, sem)) for t in tasks]
+            await asyncio.gather(*aiotasks)
+
+    def _metadata_to_download_tasks(self, output_dir: str, collections: list[dict], granules: list[dict]) -> list[DownloadTask]:
+        """
+        Converts metadata to download tasks by extracting URLs from the provided collection and
+        granule metadata
+
+        Args:
+            output_dir (str): The output directory.
+            collections (list): The list of collection metadata.
+            granules (list): The list of granule metadata.
+
+        Returns:
+            list: The list of download tasks.
+        """
+        result = []
+        i = 0
+        for metadata in collections + granules:
+            meta = metadata["meta"]
+            id_parts = [
+                p
+                for p in [meta.get("collection-concept-id"), meta["concept-id"]]
+                if p is not None
+            ]
+
+            for rurl in metadata["umm"]["RelatedUrls"]:
+                url = rurl["URL"].strip()
+                is_data = (rurl["Type"] == "GET DATA",)
+
+                # Perform metadata fixes
+                for pre, post in self.fixes:
+                    url = url.replace(pre, post)
+
+                # Skip URLs we don't want
+                if any(s in url for s in self.ignore_strings):
+                    continue
+
+                parsed = urllib.parse.urlparse(url)
+
+                root_path = self.hosts_to_paths.get(parsed.hostname)
+                if root_path is None:
+                    raise RuntimeError(
+                        f"URL is neither filtered nor mapped to an output path: {url}"
+                    )
+
+                out_path = parsed.path
+                if out_path.startswith("/"):
+                    out_path = out_path[1:]
+                if parsed.query:
+                    out_path += "?" + parsed.query
+
+                path = os.path.join(output_dir, root_path, out_path)
+                id = f'{i}/{"/".join(id_parts)}'
+                result.append(
+                    self.TaskClass(
+                        id, i, url, path, is_data, self.name, self.ignore_strings
+                    )
+                )
+                i += 1
+        return result
+
+    def _load_cmr_metadata(self) -> tuple[list[dict], list[dict]]:
+        """
+        Loads CMR metadata from files or performs a search.
+
+        Returns:
+            tuple: A tuple containing collections and granules metadata.
+        """
+        collections_file = os.path.join(self.name, "collections.json")
+        granules_file = os.path.join(self.name, "granules.json")
+        if os.path.isfile(collections_file) and os.path.isfile(granules_file):
+            with open(collections_file, "r") as file:
+                collections = json.load(file)
+            with open(granules_file, "r") as file:
+                granules = json.load(file)
+        else:
+            earthaccess.login()
+            coll_objs = earthaccess.search_datasets(**self.query)
+            gran_objs = earthaccess.search_data(**self.query)
+            collections = [{**c} for c in coll_objs]
+            granules = [{**g} for g in gran_objs]
+            with open(collections_file, "w") as f:
+                json.dump(collections, f)
+            with open(granules_file, "w") as f:
+                json.dump(granules, f)
+        return (collections, granules)
+
+    async def harvest(
+        self,
+        output_dir: str,
+        concurrency: int = 20,
+        start_i: int = 0,
+        end_i: int = -1,
+        whitelist_file: str = None,
+    ) -> None:
+        """
+        Harvests data from a CMR query and mirrors it to an output directory.
+
+        Args:
+            output_dir (str): The output directory.
+            concurrency (int): The maximum number of concurrent tasks.
+            start_i (int): The index of the first result to mirror.
+            end_i (int): The index of the last result to mirror, exclusive.
+            whitelist_file (str): The file containing a list of URLs to get.
+        """
+        if end_i == -1:
+            end_i = math.inf
+        # Output dir
+        pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+        # Status dir
+        pathlib.Path(self.name).mkdir(parents=True, exist_ok=True)
+        pathlib.Path("stop.txt").unlink(True)
+
+        whitelist = set([])
+        if whitelist_file:
+            with open(whitelist_file, "r") as file:
+                whitelist = set([l.strip() for l in file.readlines()])
+
+        collections, granules = self._load_cmr_metadata()
+        tasks = self._metadata_to_download_tasks(output_dir, collections, granules)
+
+        to_remove = set([])
+        for file in glob.glob(f"{self.name}/success.txt") + glob.glob(
+            f"{self.name}/missing.txt"
+        ):
+            if os.path.isfile(file):
+                with open(file, "r") as f:
+                    lines = [l.strip() for l in f.readlines()]
+                    to_remove = to_remove.union(set(lines))
+                logger.info(
+                    f"Filtered out {len(to_remove)} URLS from {len(lines)} lines in {file}"
+                )
+        to_remove = to_remove.difference(whitelist)
+        logger.info(f"Filtering {len(to_remove)} URLs")
+
+        tasks = [
+            t for t in tasks if t.url not in to_remove and start_i <= t.index < end_i
+        ]
+
+        data = [t for t in tasks if t.is_data]
+        non_data = [t for t in tasks if not t.is_data]
+
+        logger.info(f"Downloading {len(data)} data URLs")
+        earthaccess.login()
+        await self._run_all(data, int(concurrency))
+        await self._run_all(non_data, int(concurrency))
+        logger.info("Completed")
+
+
+class SedacDownloadTask(DownloadTask):
+    """
+    Subclasses DownloadTask to deal with a couple of quirky SEDAC URLs
+    """
+
+    @aiotools.actxmgr
+    async def _get(self, session: aiohttp.ClientSession, timeout: int):
+        """
+        Handles two application paths that require a fresh session and
+        an empty POST request after the initial GET
+
+        Args:
+            session (aiohttp.ClientSession): The client session.
+            timeout (aiohttp.ClientTimeout): The timeout for the request.
+
+        Returns:
+            aiohttp.ClientResponse: The response from the GET request.
+        """
+        url = self.url
+        is_grumpy = (
+            url.find("download.jsp?file=grumpv1") != -1
+            or url.find("download.jsp?file=gpwv3") != -1
+        )
+        if is_grumpy:
+            creds = earthaccess.auth_environ()
+            auth = aiohttp.BasicAuth(
+                creds["EARTHDATA_USERNAME"], creds["EARTHDATA_PASSWORD"]
+            )
+            # Requires new session cookies
+            async with aiohttp.ClientSession(auth=auth) as sub_session:
+                async with sub_session.get(url, timeout=timeout) as response:
+                    if response.status >= 300:
+                        yield response
+                    url = url.replace("download.jsp", "")
+                    posturl = re.sub(r"/app.*$", "/FileDownload", url)
+                    async with sub_session.post(
+                        posturl, headers={"Referer": url}, timeout=timeout
+                    ) as response1:
+                        yield response1
+        else:
+            async with session.get(url, timeout=timeout) as response:
+                yield response
+
+
+class DummyReader:
+    """ Debugging class used by DummyResponse """
+    def __init__(self, content):
+        self.content = content
+
+    async def iter_chunked(self, _):
+        for chunk in [b"ok"]:
+            yield chunk
+
+
+class DummyResponse:
+    """ Debugging response that is a 200 success that just writes "ok" """
+    def __init__(self, url):
+        self.url = url
+        self.status = 200
+        self.headers = {"Content-Length": 2}
+        self.content = DummyReader("ok")
+
+
+class DummyDownloadTask(DownloadTask):
+    """ Debugging Task type that doesn't actually fetch anything """
+    @aiotools.actxmgr
+    async def _get(self, session: aiohttp.ClientSession, timeout: int):
+        yield DummyResponse(self.url)
+
+
+def signal_handler(sig, frame):
+    """ Handles graceful shutdown """
+    pathlib.Path("stop.txt").touch()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="harvest",
+        description="Mirror files from a CMR query to an output directory",
+    )
+
+    parser.add_argument(
+        "config_file",
+        help="Configuration file defining non-host-specific parameters. See config/sedac-all.json",
+    )
+    parser.add_argument(
+        "output_dir", help="Output directory to place mirrored files in"
+    )
+    parser.add_argument(
+        "-c",
+        "--concurrency",
+        type=str,
+        default=20,
+        help="Maximum number of concurrent requests",
+    )
+    parser.add_argument(
+        "--start-i", type=int, default=0, help="Index of the first result to mirror"
+    )
+    parser.add_argument(
+        "--end-i",
+        type=int,
+        default=-1,
+        help="Index of the last result to mirror, exclusive. -1 (default) = no end index",
+    )
+    parser.add_argument(
+        "--whitelist-file",
+        help="File containing a newline-delimited list of all URLs to get",
+    )
+    args = parser.parse_args()
+    with open(args.config_file, "r") as f:
+        config = json.load(f)
+
+    harvest_args = vars(args)
+    del harvest_args["config_file"]
+
+    harvester = Harvester(config)
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, signal_handler)
+
+    try:
+        loop.run_until_complete(harvester.harvest(**harvest_args))
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()
