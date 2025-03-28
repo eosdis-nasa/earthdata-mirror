@@ -108,6 +108,15 @@ class DownloadTask:
         msgtype = "data_error" if self.is_data else "non_data_error"
         self._write(msgtype, json.dumps({"reason": reason, **vars(self)}), ext="jsonl")
 
+    def _write_redirect(self, src_url: str, dst_url: str) -> None:
+        """
+        Writes a redirected that was skipped so we can substitute it in metadata later
+
+        Args:
+            reason (str): The reason for the error.
+        """
+        self._write('redirect', json.dumps([src_url, dst_url]), ext="jsonl")
+
     async def _get(self, session: aiohttp.ClientSession, timeout: aiohttp.ClientTimeout) -> aiohttp.ClientResponse:
         """
         Sends a GET request to the URL.
@@ -165,6 +174,7 @@ class DownloadTask:
                     else:
                         final_url = str(response.url)
                         if any([p in final_url for p in self.ignore_strings]):
+                            self._write_redirect(url, final_url)
                             self._write_success(url)
                             return True
                         if os.path.dirname(self.dest) != "":
